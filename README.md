@@ -1,16 +1,16 @@
 # Order Matching Engine
 
-A simplified limit order book matching engine that simulates how exchanges match
-buy and sell orders, using **price-time priority** (the same core principle real
-exchanges like NSE/NASDAQ use).
+A simplified C++ limit order matching engine that simulates how exchanges match buy and sell orders using price-time priority.
 
 ## What it does
 
-- Reads a stream of orders (and cancels) from `data.csv`
+- Reads a stream of orders and cancellations from `data.csv`
 - Matches incoming buy/sell orders against the best available resting price
-- Supports partial fills, multiple price levels, and order cancellation
-- Writes every executed trade to `output.csv`
-- Prints a live trade log and an end-of-run summary to the console
+- Supports price-time priority, partial fills, full fills, and multi-level matching
+- Supports order cancellation
+- Performs strict input validation and prevents duplicate Order IDs
+- Records every executed trade in `output.csv`
+- Prints matching activity and an end-of-run summary to the console
 
 ## How to build and run
 
@@ -21,10 +21,18 @@ make rebuild
 
 ## Input format (`data.csv`)
 
-Pipe-delimited rows: `side | order_id | symbol | eq_type | timestamp | price | quantity`
+Pipe-delimited rows:
 
-- `side = B` or `S` → a new buy/sell order (price and quantity required)
-- `side = C` → cancel an existing resting order (price/quantity can be left blank)
+```
+side | order_id | symbol | eq_type | timestamp | price | quantity
+```
+
+- `side = B` or `S` → a new buy/sell order
+- `side = C` → cancel an existing resting order
+- Price and quantity are required for new buy/sell orders
+- Cancel orders do not require price or quantity
+
+Example:
 
 ```
 B|1|ABC|EQ|10:00:00|55.00|100
@@ -34,83 +42,82 @@ C|1|ABC|EQ|10:00:02||
 
 ## Output format (`output.csv`)
 
-One row per executed trade: `buy_order_id, sell_order_id, quantity, price`
+One row per executed trade:
 
-The file is **truncated (overwritten) on every run**, so it only ever reflects
-the most recent run's trades.
+```
+buy_order_id,sell_order_id,quantity,execution_price
+```
+
+The output file is overwritten on every run and contains only the trades generated during the most recent run.
 
 ## Core data structures
 
 ```cpp
-map<double, deque<Order>> buy_orders;   // price -> FIFO queue of resting buy orders
-map<double, deque<Order>> sell_orders;  // price -> FIFO queue of resting sell orders
-unordered_map<long long, char> order_location;  // order_id -> 'B' or 'S' (for fast cancel lookup)
+map<long long, deque<Order>> buy_orders;
+map<long long, deque<Order>> sell_orders;
+unordered_map<long long, char> order_location;
+unordered_set<long long> seen_order_ids;
 ```
 
-- **`map<double, deque<Order>>`** — a `map` keeps price levels sorted automatically,
-  so the best price is always `begin()` (lowest sell) or the last element (highest buy).
-  A `deque` at each price level preserves insertion order, giving FIFO (first-come,
-  first-served) ordering among orders resting at the same price.
-- **`unordered_map<long long, char>`** — lets `cancelOrder()` immediately know which
-  side (buy/sell) an order_id is sitting on, instead of having to search both books.
+- `map<long long, deque<Order>>` maintains price levels in sorted order.
+- The buy book prioritizes the highest price, while the sell book prioritizes the lowest price.
+- `deque<Order>` maintains FIFO ordering among orders at the same price.
+- `order_location` tracks the side of each currently active order for faster cancellation lookup.
+- `seen_order_ids` prevents reuse of Order IDs.
+- Prices are stored as integer ticks/cents rather than floating-point values to avoid precision issues.
 
-No raw pointers, `new`/`delete`, or manual memory management are used anywhere —
-every `Order` is stored and copied by value.
+No raw pointers, `new`/`delete`, or manual memory management are used. Orders are stored by value.
 
 ## Matching algorithm: price-time priority
 
-An incoming **buy** order matches against the **lowest-priced** resting sell order,
-as long as that price is **≤** the buy's price. An incoming **sell** order matches
-against the **highest-priced** resting buy order, as long as that price is **≥**
-the sell's price. Among orders at the same price, the earliest-placed order is
-matched first (FIFO).
+An incoming buy order matches against the lowest-priced resting sell order as long as:
 
-Partial fills are handled in three cases:
-1. `incoming.qty == resting.qty` → both orders fully consumed
-2. `incoming.qty < resting.qty` → resting order partially filled, its remaining
-   quantity stays in the book
-3. `incoming.qty > resting.qty` → resting order fully consumed, the incoming
-   order loops to look for the next-best price level
+```
+sell_price <= buy_price
+```
 
-If no resting order can be matched, the incoming order is parked in its own
-book at its price.
+An incoming sell order matches against the highest-priced resting buy order as long as:
 
-## Time complexity
+```
+buy_price >= sell_price
+```
 
-| Operation | Complexity | Why |
-|---|---|---|
-| Insert a new order (no match) | O(log n) | one `map` insertion, where n = number of distinct price levels |
-| Match against best price | O(log n) per price level crossed, O(1) per order within a level | `map::begin()`/`rbegin()` is O(1); erasing an empty price level is O(log n) |
-| Cancel an order | O(1) average | `unordered_map` lookup for side, then a scan within that side's price levels |
-| Print full book | O(n) | n = total resting orders |
+Among orders at the same price, the earliest-resting order is matched first (FIFO).
 
-## Design decisions and trade-offs
+The engine supports:
 
-- **Why `map` + `deque` instead of a single sorted vector?** A sorted vector would
-  need O(n) insertion to keep it ordered. `map` gives O(log n) insertion and
-  automatic ordering by price, and a `deque` per price level keeps FIFO ordering
-  without re-sorting on every insert.
-- **Why scan price levels on cancel instead of storing an exact price in the index?**
-  Cancellation is rare compared to matching in a realistic order flow, so trading
-  a small amount of cancel-time cost for a simpler index (`order_id -> side` only)
-  was a deliberate simplicity-for-performance trade-off.
-- **Why does a cancel for a non-existent order just fail silently (logged, not
-  thrown)?** Real market data feeds can have out-of-order or duplicate messages
-  (e.g. a cancel arriving for an order that was already fully matched). The engine
-  treats this as a normal, expected case rather than an error — it logs and moves on,
-  rather than crashing or queuing a "pending cancel" for later.
-- **Why store `Order` by value everywhere instead of using pointers?** At this
-  scale, the simplicity and safety of value semantics (no manual memory management,
-  no dangling pointers, no ownership ambiguity) outweighs the minor copying cost.
-  A production system handling millions of orders/sec would likely use a different
-  memory layout, but that's a different problem than the one this project solves.
+1. **Full fill**: incoming and resting quantities are equal.
+2. **Partial fill of resting order**: incoming quantity is smaller.
+3. **Partial fill of incoming order**: resting quantity is smaller, so the incoming order continues matching against the next available price level.
 
-## What this project deliberately does not include
+If no further match is possible, the remaining quantity of the incoming order rests in its corresponding book.
 
-- **Multithreading** — real matching engines are typically single-threaded by
-  design, since price-time priority depends on strict sequential processing.
-  Threading the matcher itself would risk *incorrect* matching, not just be
-  harder to implement.
-- **Persistence/database** — the order book is intentionally in-memory only,
-  matching how real low-latency matching engines operate; persistence is a
-  separate concern handled by downstream systems (e.g. trade reporting, audit logs).
+## Execution price
+
+Trades execute at the **resting order's price**.
+
+For example:
+
+```
+Resting SELL: 100 @ 50.00
+Incoming BUY: 100 @ 55.00
+```
+
+The trade executes at:
+
+```
+50.00
+```
+
+Similarly:
+
+```
+Resting BUY: 100 @ 55.00
+Incoming SELL: 100 @ 50.00
+```
+
+The trade executes at:
+
+```
+55.00
+```
