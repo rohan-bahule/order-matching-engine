@@ -1,0 +1,21 @@
+# Build output
+obj/
+sim
+*.exe
+
+# Input / generated data
+data.csv
+output.csv
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Compiled objects
+*.o
+*.out
